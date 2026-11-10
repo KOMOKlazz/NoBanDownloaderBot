@@ -181,8 +181,11 @@ async def main() -> None:
     if LOCAL_API:
         session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_API, is_local=True))
     bot = Bot(TOKEN, session=session, default=DefaultBotProperties(parse_mode="HTML"))
-    if not shutil.which("ffmpeg"):
-        logging.warning("ffmpeg не найден в PATH — видео обрабатываться не будут!")
+    from processing import FFMPEG
+    if FFMPEG:
+        logging.info("ffmpeg: %s", FFMPEG)
+    else:
+        logging.warning("ffmpeg не найден — видео обрабатываться не будут! pip install imageio-ffmpeg")
     await dp.start_polling(bot)
 
 

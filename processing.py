@@ -11,7 +11,10 @@
 """
 from __future__ import annotations
 
+import glob
+import os
 import random
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -20,8 +23,24 @@ from typing import Callable
 import numpy as np
 from PIL import Image, ImageOps
 
-FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
-FFPROBE = shutil.which("ffprobe") or "ffprobe"
+
+def _find_ffmpeg() -> str | None:
+    """FFMPEG_PATH из .env → PATH → установка winget → встроенный из imageio-ffmpeg."""
+    if os.getenv("FFMPEG_PATH") and Path(os.environ["FFMPEG_PATH"]).is_file():
+        return os.environ["FFMPEG_PATH"]
+    if found := shutil.which("ffmpeg"):
+        return found
+    winget = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\*FFmpeg*\*\bin\ffmpeg.exe")
+    if hits := sorted(glob.glob(winget)):
+        return hits[-1]
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+FFMPEG = _find_ffmpeg()
 
 
 # ---------------------------------------------------------------- фото ----
@@ -61,25 +80,14 @@ def process_image(src: Path, dst_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------- видео ---
-def _has_audio(src: Path) -> bool:
-    r = subprocess.run(
-        [FFPROBE, "-v", "error", "-select_streams", "a",
-         "-show_entries", "stream=index", "-of", "csv=p=0", str(src)],
-        capture_output=True, text=True, check=False,
-    )
-    return bool(r.stdout.strip())
-
-
-def _duration(src: Path) -> float:
-    r = subprocess.run(
-        [FFPROBE, "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nw=1:nk=1", str(src)],
-        capture_output=True, text=True, check=False,
-    )
-    try:
-        return float(r.stdout.strip())
-    except ValueError:
-        return 0.0
+def _probe(src: Path) -> tuple[float, bool]:
+    """(длительность в секундах, есть ли звук) — через сам ffmpeg, без ffprobe."""
+    r = subprocess.run([FFMPEG, "-hide_banner", "-i", str(src)], capture_output=True,
+                       text=True, encoding="utf-8", errors="ignore", check=False)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
+    dur = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]) if m else 0.0
+    has_audio = re.search(r"Stream #\S+.*?: Audio:", r.stderr) is not None
+    return dur, has_audio
 
 
 def _encode(src: Path, dst: Path, p: dict, audio: bool, vkbps: int, max_h: int | None,
@@ -153,9 +161,12 @@ def process_video(src: Path, dst_dir: Path, max_bytes: int,
         "sr": random.choice([44100, 48000]),
         "gop": random.choice([48, 50, 60, 72, 90]),
     }
-    audio = _has_audio(src)
+    if not FFMPEG:
+        raise RuntimeError("ffmpeg не найден: выполни pip install imageio-ffmpeg "
+                           "или укажи FFMPEG_PATH в .env")
+    dur, audio = _probe(src)
     dst = dst_dir / f"{src.stem[:60]}_r.mp4"
-    out_dur = _duration(src) / p["speed"]
+    out_dur = dur / p["speed"]
 
     # Битрейт считаем заранее, чтобы уложиться в лимит Telegram за один проход.
     if out_dur > 0:
