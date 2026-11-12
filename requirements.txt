@@ -4,4 +4,5 @@ gallery-dl>=1.28
 Pillow>=10.0
 numpy>=1.26
 python-dotenv>=1.0
+playwright>=1.45  # для Threads; после установки: python -m playwright install chromium
 imageio-ffmpeg>=0.5  # встроенный ffmpeg, если системного нет (например, на сервере)

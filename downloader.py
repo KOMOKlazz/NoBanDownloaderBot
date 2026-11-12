@@ -100,6 +100,11 @@ def _via_gallerydl(url: str, out: Path, cookies: str | None) -> None:
         raise RuntimeError(errs[-1] if errs else f"код выхода {r.returncode}")
 
 
+def _via_threads(url: str, out: Path, cookies: str | None) -> None:
+    import threads_dl
+    threads_dl.download(url, out)
+
+
 def _via_og_tags(url: str, out: Path) -> None:
     """Последний шанс (полезно для Threads): берём og:video / og:image со страницы."""
     req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -120,8 +125,11 @@ def download(url: str, out: Path, cookies: str | None = None) -> list[Path]:
     out.mkdir(parents=True, exist_ok=True)
     errors = []
 
+    # Threads — свой загрузчик через headless-браузер;
     # TikTok стабильнее отдаёт видео через gallery-dl, остальное — через yt-dlp.
-    if "tiktok.com" in url.lower():
+    if "threads.net" in url.lower() or "threads.com" in url.lower():
+        order = (_via_threads, _via_og_tags)
+    elif "tiktok.com" in url.lower():
         order = (_via_gallerydl, _via_ytdlp, _via_og_tags)
     else:
         order = (_via_ytdlp, _via_gallerydl, _via_og_tags)
