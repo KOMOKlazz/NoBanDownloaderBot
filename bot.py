@@ -136,44 +136,105 @@ async def on_text(msg: Message) -> None:
         await handle_url(msg, url)
 
 
+MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".mkv", ".m4v"}
+
+
+def file_info(msg: Message):
+    """(объект файла, расширение) или None, если это не фото/видео."""
+    if msg.photo:
+        return msg.photo[-1], ".jpg"
+    if msg.video:
+        return msg.video, ".mp4"
+    if msg.animation:
+        return msg.animation, ".mp4"
+    if msg.document:
+        mime = msg.document.mime_type or ""
+        if not (mime.startswith("image/") or mime.startswith("video/")):
+            return None
+        ext = Path(msg.document.file_name or "").suffix.lower()
+        if ext not in MEDIA_EXTS:
+            ext = ".mp4" if mime.startswith("video/") else ".jpg"
+        return msg.document, ext
+    return None
+
+
+async def handle_files(msgs: list[Message], bot: Bot) -> None:
+    """Обрабатывает одно или несколько присланных сообщений с медиа и отвечает
+    одним файлом или альбомом в том же порядке."""
+    first = msgs[0]
+    items, skipped, too_big = [], 0, 0
+    for m in msgs:
+        info = file_info(m)
+        if not info:
+            skipped += 1
+        elif info[0].file_size and info[0].file_size > MAX_INCOMING:
+            too_big += 1
+        else:
+            items.append(info)
+
+    notes = []
+    if skipped:
+        notes.append(f"пропущено не-медиа: {skipped}")
+    if too_big:
+        notes.append(f"больше {MAX_INCOMING // 1024 // 1024} МБ (пришли ссылкой): {too_big}")
+    if not items:
+        await first.answer("Принимаю только фото и видео" + (f" ({'; '.join(notes)})" if notes else "") + ".")
+        return
+    if notes:
+        await first.answer("⚠️ " + "; ".join(notes))
+
+    status = await first.answer("⏳ Получаю файлы…" if len(items) > 1 else "⏳ Получаю файл…")
+    tmp = Path(tempfile.mkdtemp(prefix="reposter_"))
+    try:
+        (tmp / "src").mkdir(parents=True)
+        files = []
+        for i, (obj, ext) in enumerate(items, 1):
+            src = tmp / "src" / f"{i:03d}{ext}"  # номер в имени сохраняет порядок
+            await bot.download(obj.file_id, destination=src)
+            files.append(src)
+        async with work_slots:
+            await process_and_send(first, status, files, tmp)
+    except Exception as e:  # noqa: BLE001
+        logging.exception("Ошибка обработки файлов")
+        await fail(status, f"❌ Ошибка: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Альбом приходит боту отдельными сообщениями с общим media_group_id.
+# Копим их и обрабатываем, когда новые части перестали приходить.
+ALBUM_WAIT = 2.0
+_albums: dict[tuple[int, str], list[Message]] = {}
+_album_timers: dict[tuple[int, str], asyncio.Task] = {}
+
+
+async def _flush_album(key: tuple[int, str], bot: Bot) -> None:
+    try:
+        await asyncio.sleep(ALBUM_WAIT)
+    except asyncio.CancelledError:
+        return  # пришла ещё одна часть альбома — таймер перезапущен
+    _album_timers.pop(key, None)
+    msgs = sorted(_albums.pop(key, []), key=lambda m: m.message_id)
+    if msgs:
+        await handle_files(msgs, bot)
+
+
+@dp.message(F.media_group_id, F.photo | F.video | F.document | F.animation)
+async def on_album_part(msg: Message, bot: Bot) -> None:
+    if not allowed(msg):
+        return
+    key = (msg.chat.id, msg.media_group_id)
+    _albums.setdefault(key, []).append(msg)
+    if timer := _album_timers.get(key):
+        timer.cancel()
+    _album_timers[key] = asyncio.create_task(_flush_album(key, bot))
+
+
 @dp.message(F.photo | F.video | F.document | F.animation)
 async def on_file(msg: Message, bot: Bot) -> None:
     if not allowed(msg):
         return
-    if msg.photo:
-        obj, ext = msg.photo[-1], ".jpg"
-    elif msg.video:
-        obj, ext = msg.video, ".mp4"
-    elif msg.animation:
-        obj, ext = msg.animation, ".mp4"
-    else:
-        obj = msg.document
-        mime = obj.mime_type or ""
-        if not (mime.startswith("image/") or mime.startswith("video/")):
-            await msg.answer("Принимаю только фото и видео.")
-            return
-        ext = Path(obj.file_name or "").suffix.lower()
-        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".mkv", ".m4v"}:
-            ext = ".mp4" if mime.startswith("video/") else ".jpg"
-
-    if obj.file_size and obj.file_size > MAX_INCOMING:
-        await msg.answer(f"Файл больше {MAX_INCOMING // 1024 // 1024} МБ — обычный Bot API не даёт "
-                         "ботам скачивать такие. Пришли лучше ссылку.")
-        return
-
-    status = await msg.answer("⏳ Получаю файл…")
-    tmp = Path(tempfile.mkdtemp(prefix="reposter_"))
-    try:
-        src = tmp / "src" / f"input{ext}"
-        src.parent.mkdir(parents=True)
-        await bot.download(obj.file_id, destination=src)
-        async with work_slots:
-            await process_and_send(msg, status, [src], tmp)
-    except Exception as e:  # noqa: BLE001
-        logging.exception("Ошибка обработки файла")
-        await fail(status, f"❌ Ошибка: {e}")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    await handle_files([msg], bot)
 
 
 async def main() -> None:
