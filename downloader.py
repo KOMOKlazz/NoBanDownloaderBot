@@ -128,7 +128,8 @@ def download(url: str, out: Path, cookies: str | None = None) -> list[Path]:
     # Threads — свой загрузчик через headless-браузер;
     # TikTok стабильнее отдаёт видео через gallery-dl, остальное — через yt-dlp.
     if "threads.net" in url.lower() or "threads.com" in url.lower():
-        order = (_via_threads, _via_og_tags)
+        # og-теги для Threads ничего не дают, а лишний запрос приближает блокировку (429)
+        order = (_via_threads,)
     elif "tiktok.com" in url.lower():
         order = (_via_gallerydl, _via_ytdlp, _via_og_tags)
     else:
@@ -141,6 +142,8 @@ def download(url: str, out: Path, cookies: str | None = None) -> list[Path]:
             else:
                 method(url, out, cookies)
         except Exception as e:  # noqa: BLE001 — пробуем следующий способ
+            if type(e).__name__ == "ThreadsError":  # понятная причина — без технических деталей
+                raise DownloadError(f"{e}\n\nМожно просто прислать мне фото или видео файлом.") from None
             errors.append(f"{method.__name__}: {e}")
         files = _media_files(out)
         if files:

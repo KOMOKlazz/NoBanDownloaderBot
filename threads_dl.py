@@ -16,6 +16,18 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
 
+class ThreadsError(Exception):
+    """Понятная причина, по которой пост не скачать."""
+
+
+RATE_LIMITED = ("Threads временно ограничил запросы с этого сервера (ошибка 429). "
+                "Meta строже относится к IP дата-центров. Попробуй через 10–30 минут.")
+RESTRICTED = ("Пост закрыт: Threads показывает его только вошедшим в аккаунт "
+              "(«Этот контент доступен не всем»). Без логина его не скачать.")
+RESTRICTED_MARKERS = ("доступен не всем", "isn't available to everyone",
+                      "not available to everyone", "content isn't available", "content is not available")
+
+
 def shortcode(url: str) -> str | None:
     m = re.search(r"/post/([A-Za-z0-9_-]+)", url)
     return m.group(1) if m else None
@@ -41,16 +53,29 @@ def _page_json(url: str, code: str) -> list[str]:
             page.route("**/*", lambda route: route.abort()
                        if route.request.resource_type in ("image", "media", "font", "stylesheet")
                        else route.continue_())
-            page.goto(url, wait_until="commit", timeout=90_000)
+            try:
+                page.goto(url, wait_until="commit", timeout=90_000)
+            except Exception as e:  # noqa: BLE001
+                if "ERR_HTTP_RESPONSE_CODE_FAILURE" in str(e):
+                    raise ThreadsError(RATE_LIMITED) from None
+                raise
             # Ждём, пока в странице появятся данные именно этого поста. Опрашиваем из
             # Python: wait_for_function использует eval, а CSP Threads его запрещает.
             selector = 'script[type="application/json"]'
-            deadline = time.monotonic() + 90
+            deadline = time.monotonic() + 60
             while True:
                 texts = page.eval_on_selector_all(selector, "els => els.map(e => e.textContent)")
                 found = [t for t in texts if code in t and "image_versions2" in t]
-                if found or time.monotonic() > deadline:
+                if found:
                     return found
+                try:
+                    body = page.inner_text("body", timeout=2000).lower()
+                except Exception:  # noqa: BLE001
+                    body = ""
+                if any(m in body for m in RESTRICTED_MARKERS):
+                    raise ThreadsError(RESTRICTED)
+                if time.monotonic() > deadline:
+                    return []
                 page.wait_for_timeout(1000)
         finally:
             browser.close()
