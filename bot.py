@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, InputMediaDocument, Message
 from dotenv import load_dotenv
@@ -82,14 +83,43 @@ async def process_and_send(msg: Message, status: Message, files: list[Path], tmp
 
         results.append(await asyncio.to_thread(process, f, tmp / "out", MAX_BYTES, on_progress))
 
-    await status.edit_text("📤 Отправляю…")
+    size_mb = sum(p.stat().st_size for p in results) / 1024 / 1024
+    await _safe_edit(status, f"📤 Отправляю ({size_mb:.0f} МБ)…")
+    # msg.answer_* возвращает объект запроса; таймаут задаётся при вызове bot(...)
     if len(results) == 1:
-        await msg.answer_document(FSInputFile(results[0]))
+        await send_with_retry(lambda: msg.bot(
+            msg.answer_document(FSInputFile(results[0])), request_timeout=UPLOAD_TIMEOUT))
     else:
         for i in range(0, len(results), 10):  # альбом из документов, по 10 штук
-            group = [InputMediaDocument(media=FSInputFile(p)) for p in results[i:i + 10]]
-            await msg.answer_media_group(group)
-    await status.delete()
+            chunk = results[i:i + 10]
+            await send_with_retry(lambda chunk=chunk: msg.bot(
+                msg.answer_media_group([InputMediaDocument(media=FSInputFile(p)) for p in chunk]),
+                request_timeout=UPLOAD_TIMEOUT))
+    try:
+        await status.delete()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# Отправка файла до 50 МБ на медленном канале может идти несколько минут,
+# а по умолчанию aiogram ждёт ответа Telegram всего 60 с.
+UPLOAD_TIMEOUT = 900
+
+
+async def send_with_retry(make_request, attempts: int = 3):
+    """Повторяет отправку при обрыве сети/таймауте и при flood control Telegram."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await make_request()
+        except TelegramRetryAfter as e:  # Telegram просит подождать
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramNetworkError:
+            if attempt == attempts:
+                raise
+            logging.warning("Сеть: не удалось отправить файл, попытка %d/%d", attempt, attempts)
+            await asyncio.sleep(5 * attempt)
 
 
 async def fail(status: Message, text: str) -> None:

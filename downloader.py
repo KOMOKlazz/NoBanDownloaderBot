@@ -113,7 +113,12 @@ def _via_ytdlp(url: str, out: Path, cookies: str | None) -> None:
         "logger": _SilentLogger(),  # ошибки и так попадут в ответ бота
     }
     if cookies:
-        opts["cookiefile"] = cookies
+        # yt-dlp перезаписывает файл cookies после работы. Если сайт сбросил сессию,
+        # он затрёт рабочие cookies — поэтому отдаём ему временную копию.
+        import shutil
+        tmp_cookies = out / ".cookies.txt"
+        shutil.copyfile(cookies, tmp_cookies)
+        opts["cookiefile"] = str(tmp_cookies)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -197,7 +202,12 @@ def download(url: str, out: Path, cookies: str | None = None) -> list[Path]:
     joined = "\n".join(errors)
     if "confirm you" in joined and "not a bot" in joined:
         msg = ("YouTube не отдаёт видео без входа в аккаунт («подтвердите, что вы не бот»). "
-               "Нужен файл cookies.txt от аккаунта YouTube — см. раздел про YouTube в README.")
+               "Нужен рабочий cookies.txt от аккаунта YouTube; если он уже есть — "
+               "сессия истекла, экспортируй cookies заново (см. README).")
+    elif "confirm your age" in joined:
+        msg = ("Видео 18+: YouTube отдаёт его только аккаунту с подтверждённым возрастом. "
+               "Нужен cookies.txt от аккаунта, которому YouTube уже показывает это видео "
+               "без запроса подтверждения возраста.")
     else:
         msg = "Не удалось скачать медиа.\n" + joined[-1500:]
     msg += "\n\nМожно просто прислать мне фото или видео файлом."
