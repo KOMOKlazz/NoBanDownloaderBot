@@ -10,6 +10,44 @@ from pathlib import Path
 
 import yt_dlp
 
+
+def _ensure_deno_on_path() -> None:
+    """yt-dlp ищет JS-движок Deno (нужен для YouTube) в PATH. Если бот запущен из
+    окна, открытого до установки Deno, PATH старый — добавляем папку сами."""
+    import glob
+    import os
+    import shutil
+    if shutil.which("deno"):
+        return
+    exe = "deno.exe" if os.name == "nt" else "deno"
+    # 1) pip-пакет deno (pip install deno) — кладёт бинарник рядом с python или внутрь пакета
+    candidates = [os.path.join(os.path.dirname(sys.executable), exe),
+                  os.path.join(os.path.dirname(sys.executable), "Scripts", exe)]
+    try:
+        import deno as _deno_pkg
+        if hasattr(_deno_pkg, "find_deno_bin"):
+            candidates.insert(0, str(_deno_pkg.find_deno_bin()))
+        pkg_dir = os.path.dirname(_deno_pkg.__file__)
+        candidates += glob.glob(os.path.join(pkg_dir, "**", exe), recursive=True)
+    except Exception:  # noqa: BLE001 — пакет не установлен
+        pass
+    # 2) winget на Windows и установка скриптом на Linux
+    candidates += glob.glob(os.path.expandvars(
+        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\DenoLand.Deno*\deno.exe"))
+    candidates.append(os.path.expanduser("~/.deno/bin/deno"))
+    for c in candidates:
+        if os.path.isfile(c):
+            if os.name != "nt" and not os.access(c, os.X_OK):
+                try:
+                    os.chmod(c, 0o755)
+                except OSError:
+                    continue
+            os.environ["PATH"] = os.path.dirname(c) + os.pathsep + os.environ.get("PATH", "")
+            return
+
+
+_ensure_deno_on_path()
+
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 MEDIA_EXT = VIDEO_EXT | IMAGE_EXT
@@ -56,15 +94,18 @@ class _SilentLogger:
 
 
 def _via_ytdlp(url: str, out: Path, cookies: str | None) -> None:
-    """Видео качает yt-dlp; фото (у которых нет видеоформатов) — по ссылке на картинку.
+    """Видео качает yt-dlp. Для Instagram элементы без видеоформатов — это фото,
+    их берём по ссылке на картинку (так скачиваются фото-посты и карусели).
 
-    Так без логина скачиваются и фото-посты, и карусели Instagram (фото + видео).
+    Для YouTube/TikTok «нет видеоформатов» — это ошибка (обычно YouTube требует
+    вход), и подсовывать вместо видео превью нельзя.
     """
+    photos_allowed = "instagram.com" in url.lower()
     opts = {
         "outtmpl": str(out / "%(playlist_index|0)03d_%(id)s.%(ext)s"),
         "format": FORMAT,
         "merge_output_format": "mp4",
-        "ignore_no_formats_error": True,  # фото-элементы не роняют весь пост
+        "ignore_no_formats_error": photos_allowed,  # фото-элементы не роняют весь пост
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -83,7 +124,7 @@ def _via_ytdlp(url: str, out: Path, cookies: str | None) -> None:
             has_video = any(f.get("vcodec") != "none" for f in entry.get("formats") or [])
             if has_video:
                 ydl.process_ie_result(entry, download=True)
-            elif (img := _best_image(entry)) and not entry.get("formats"):
+            elif photos_allowed and not entry.get("formats") and (img := _best_image(entry)):
                 _fetch(img, out / f"{n:03d}_{entry.get('id', 'img')}.jpg")
 
 
@@ -127,11 +168,15 @@ def download(url: str, out: Path, cookies: str | None = None) -> list[Path]:
 
     # Threads — свой загрузчик через headless-браузер;
     # TikTok стабильнее отдаёт видео через gallery-dl, остальное — через yt-dlp.
-    if "threads.net" in url.lower() or "threads.com" in url.lower():
-        # og-теги для Threads ничего не дают, а лишний запрос приближает блокировку (429)
+    # og-теги у видеохостингов — это только превью, поэтому для них их не используем.
+    low = url.lower()
+    if "threads.net" in low or "threads.com" in low:
+        # лишний запрос к Threads только приближает блокировку (429)
         order = (_via_threads,)
-    elif "tiktok.com" in url.lower():
-        order = (_via_gallerydl, _via_ytdlp, _via_og_tags)
+    elif "tiktok.com" in low:
+        order = (_via_gallerydl, _via_ytdlp)
+    elif "youtube.com" in low or "youtu.be" in low:
+        order = (_via_ytdlp,)  # gallery-dl YouTube не поддерживает
     else:
         order = (_via_ytdlp, _via_gallerydl, _via_og_tags)
 
@@ -149,6 +194,11 @@ def download(url: str, out: Path, cookies: str | None = None) -> list[Path]:
         if files:
             return files
 
-    msg = "Не удалось скачать медиа.\n" + "\n".join(errors)[-1500:]
+    joined = "\n".join(errors)
+    if "confirm you" in joined and "not a bot" in joined:
+        msg = ("YouTube не отдаёт видео без входа в аккаунт («подтвердите, что вы не бот»). "
+               "Нужен файл cookies.txt от аккаунта YouTube — см. раздел про YouTube в README.")
+    else:
+        msg = "Не удалось скачать медиа.\n" + joined[-1500:]
     msg += "\n\nМожно просто прислать мне фото или видео файлом."
     raise DownloadError(msg)
